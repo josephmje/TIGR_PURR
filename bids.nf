@@ -55,22 +55,95 @@ if (params.subjects) {
 // Main Processes
 
 all_dirs = file(params.bids)
+invalid_channel = Channel.create()
+sub_channel = Channel.create()
 
-if (!params.subjects){
-
+// Store all subjects
 bids_channel = Channel
                     .from(all_dirs.list())
                     .filter { it.contains('sub-') }
 
-}else {
+// Process subject list
+if (params.subjects){
 
-sublist=file("$params.subjects")
-bids_channel = Channel
-                    .from(sublist)
-                    .splitText() { it.strip() }
-                    .filter { it.contains('sub-') }
+
+    //Load in sublist
+    sublist = file(params.subjects)
+    input_sub_channel = Channel.from(sublist)
+                               .splitText() { it.strip() }
+
+    process split_invalid{
+
+        publishDir "$params.out/pipeline_logs", \
+                 mode: 'copy', \
+                 saveAs: { 'invalid_subjects.log' }, \
+                 pattern: 'invalid'
+
+        input:
+        val subs from input_sub_channel.collect()
+        val available_subs from bids_channel.collect()
+
+        output:
+        file 'valid' into valid_subs
+        file 'invalid' optional true into invalid_subs
+
+
+        """
+        #!/usr/bin/env python
+
+        import os
+        print(os.getcwd())
+
+        def nflist_2_pylist(x):
+            x = x.strip('[').strip(']')
+            x = [x.strip(' ').strip("\\n") for x in x.split(',')]
+            return x
+        
+        #Process full BIDS subjects
+        bids_subs = nflist_2_pylist("$available_subs")
+        input_subs = nflist_2_pylist("$subs")
+
+        print(input_subs)
+        valid_subs = [x for x in input_subs if x in bids_subs]
+        invalid_subs = [x for x in input_subs if x not in valid_subs]
+
+        with open('valid','w') as f:
+            f.writelines("\\n".join(valid_subs))
+
+        if invalid_subs:
+
+            with open('invalid','w') as f:
+                f.writelines("\\n".join(invalid_subs)) 
+                f.write("\\n")
+
+        """
+
+    }
+
+
+    //Write into main subject channel
+    sub_channel = valid_subs
+                        .splitText() { it.strip() }
+}else{
+
+    bids_channel.into(sub_channel)
+
 }
 
+
+// Filter out invalid subjects
+process save_invocation{
+
+    // Push input file into output folder
+
+    input:
+    file invocation from Channel.fromPath("$params.invocation")
+    
+    """
+    cp ${params.invocation} ${params.out}
+    """
+
+}
 
 process modify_invocation{
     
@@ -79,7 +152,7 @@ process modify_invocation{
     // subject specific invocation
 
     input:
-    val sub from bids_channel
+    val sub from sub_channel
 
     output:
     file "${sub}.json" into invoke_json
@@ -113,28 +186,19 @@ process run_bids{
     input:
     file sub_input from invoke_json
 
-    output:
-    file '.command.*' into logs
+    output: 
+    val 'pseudo_output' into pseudo_output
 
     beforeScript "source /etc/profile"
     scratch true
-
-    publishDir "$params.out/pipeline_logs", \
-                 mode: 'copy', \
-                 saveAs: { "$sub_input".replace('.json','.out')}, \
-                 pattern: '.command.out'
-
-    publishDir "$params.out/pipeline_logs", \
-                 mode: 'copy', \
-                 saveAs: { "$sub_input".replace('.json','.err')}, \
-                 pattern: '.command.err'
 
     module 'slurm'
 
     shell:
     '''
 
-    application=!{params.application}
+    #Stop error rejection
+    set +e
 
     echo bosh exec launch \
     -v !{params.bids}:/bids \
@@ -143,12 +207,31 @@ process run_bids{
     !{params.descriptor} $(pwd)/!{sub_input} \
     --imagepath !{params.simg} -x --stream
 
+    #Make logging folder
+    logging_dir=!{params.out}/pipeline_logs/!{params.application}
+    mkdir -p ${logging_dir}
+
+    #Set up logging output
+    sub_json=!{sub_input}
+    sub=${sub_json%.json}
+    log_out=${logging_dir}/${sub}.out
+    log_err=${logging_dir}/${sub}.err
+
+
+    echo "TASK ATTEMPT !{task.attempt}" >> ${log_out}
+    echo "============================" >> ${log_out}
+    echo "TASK ATTEMPT !{task.attempt}" >> ${log_err}
+    echo "============================" >> ${log_err}
+
     bosh exec launch \
     -v !{params.bids}:/bids \
     -v !{params.out}:/output \
     -v !{params.license}:/license \
     !{params.descriptor} $(pwd)/!{sub_input} \
-    --imagepath !{params.simg} -x --stream
+    --imagepath !{params.simg} -x --stream 2>> ${log_out} \
+                                           1>> ${log_err}
 
     '''
 }
+
+
